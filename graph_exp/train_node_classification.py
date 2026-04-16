@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -14,6 +15,10 @@ import torch.nn.functional as F
 from graph_exp.datasets import load_dataset
 from graph_exp.metrics import ClassificationMetrics, compute_classification_metrics
 from graph_exp.models import build_model
+
+
+SUPPORTED_DATASETS = ["ogbn-arxiv", "cora", "pubmed", "amazon-photo", "children", "history", "photo"]
+SUPPORTED_MODELS = ["mlp", "gcn", "sage", "gat", "sgc", "jknet", "appnp"]
 
 
 @dataclass
@@ -33,9 +38,13 @@ class RunResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Node classification benchmark runner.")
-    parser.add_argument("--dataset", required=True, choices=["ogbn-arxiv", "cora", "pubmed", "amazon-photo"])
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
+    parser.add_argument("--datasets", nargs="+", choices=SUPPORTED_DATASETS)
     parser.add_argument("--root", default="data", help="Dataset root directory.")
-    parser.add_argument("--model", default="gcn", choices=["gcn", "sage", "gat", "mlp"])
+    parser.add_argument("--model", choices=SUPPORTED_MODELS)
+    parser.add_argument("--models", nargs="+", choices=SUPPORTED_MODELS)
+    parser.add_argument("--feature-type", dest="feature_type")
+    parser.add_argument("--feature-types", nargs="+", dest="feature_types")
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.5)
@@ -50,7 +59,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-ratio", type=float, default=0.1)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--output-dir", default="results/graph_exp")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if not args.dataset and not args.datasets:
+        parser.error("Provide --dataset or --datasets.")
+    if not args.model and not args.models:
+        parser.error("Provide --model or --models.")
+
+    args.datasets = args.datasets or [args.dataset]
+    args.models = args.models or [args.model]
+    args.feature_types = args.feature_types or ([args.feature_type] if args.feature_type else ["raw"])
+    return args
 
 
 def set_seed(seed: int) -> None:
@@ -87,6 +106,7 @@ def train_one_run(args: argparse.Namespace, run_seed: int, device: torch.device)
         seed=run_seed,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        feature_type=args.feature_type,
     )
     data = loaded.data.to(device)
 
@@ -169,7 +189,8 @@ def summarise_runs(results: list[RunResult]) -> dict[str, float]:
 def save_results(args: argparse.Namespace, results: list[RunResult], summary: dict[str, float]) -> Path:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{args.dataset}_{args.model}.json"
+    feature_suffix = f"_{args.feature_type}" if args.feature_type else ""
+    output_path = output_dir / f"{args.dataset}{feature_suffix}_{args.model}.json"
     payload = {
         "config": vars(args),
         "runs": [asdict(result) for result in results],
@@ -179,17 +200,15 @@ def save_results(args: argparse.Namespace, results: list[RunResult], summary: di
     return output_path
 
 
-def main() -> None:
-    args = parse_args()
-    device = choose_device(args.device)
+def run_experiment(args: argparse.Namespace, device: torch.device) -> Path:
     results: list[RunResult] = []
-
     for run_idx in range(args.runs):
         run_seed = args.seed + run_idx
         result = train_one_run(args, run_seed, device)
         results.append(result)
         print(
             f"[run {run_idx + 1}/{args.runs}] "
+            f"dataset={args.dataset} feature={args.feature_type} model={args.model} "
             f"seed={run_seed} best_epoch={result.best_epoch} "
             f"test_acc={result.test.accuracy:.4f} "
             f"test_f1_macro={result.test.f1_macro:.4f}"
@@ -198,11 +217,29 @@ def main() -> None:
     summary = summarise_runs(results)
     output_path = save_results(args, results, summary)
     print(
-        f"[summary] dataset={args.dataset} model={args.model} "
-        f"acc={summary['test_accuracy_mean']:.4f}±{summary['test_accuracy_std']:.4f} "
-        f"f1_macro={summary['test_f1_macro_mean']:.4f}±{summary['test_f1_macro_std']:.4f}"
+        f"[summary] dataset={args.dataset} feature={args.feature_type} model={args.model} "
+        f"acc={summary['test_accuracy_mean']:.4f}+/-{summary['test_accuracy_std']:.4f} "
+        f"f1_macro={summary['test_f1_macro_mean']:.4f}+/-{summary['test_f1_macro_std']:.4f}"
     )
     print(f"[saved] {output_path}")
+    return output_path
+
+
+def main() -> None:
+    args = parse_args()
+    device = choose_device(args.device)
+    saved_paths: list[Path] = []
+
+    for dataset_name in args.datasets:
+        for feature_type in args.feature_types:
+            for model_name in args.models:
+                run_args = copy.deepcopy(args)
+                run_args.dataset = dataset_name
+                run_args.feature_type = feature_type
+                run_args.model = model_name
+                saved_paths.append(run_experiment(run_args, device))
+
+    print(f"[done] saved {len(saved_paths)} result files to {Path(args.output_dir)}")
 
 
 if __name__ == "__main__":

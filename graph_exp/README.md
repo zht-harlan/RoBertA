@@ -62,3 +62,36 @@ python -m graph_exp.train_node_classification \
 ```
 
 Results are written to `results/graph_exp/<dataset>_<model>.json`.
+
+## Local dataset batches
+
+The runner also supports local datasets stored under `--root/<dataset>/` with
+separate graph, label, split, and feature files. The local dataset names
+currently supported are:
+
+- `children`
+- `history`
+- `photo`
+
+For local datasets, feature tensors can be selected with `--feature-type` or
+`--feature-types`. Common filenames such as `plm.pt`, `x_plm.pt`,
+`features/plm.pt`, `labels.pt`, `edge_index.pt`, `split_idx.pt`,
+`train_idx.pt`, and `val_mask.pt` are detected automatically.
+
+Batch run example:
+
+```bash
+python -m graph_exp.train_node_classification \
+  --root ../dataset \
+  --datasets children history photo \
+  --feature-types plm \
+  --models mlp gcn sage gat sgc jknet appnp \
+  --num-layers 1 \
+  --hidden-dim 256 \
+  --dropout 0.2 \
+  --lr 0.01 \
+  --runs 3 \
+  --output-dir outputs_plm
+```
+
+Outputs are written as `outputs_plm/<dataset>_<feature_type>_<model>.json`.
