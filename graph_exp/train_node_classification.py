@@ -38,11 +38,11 @@ class RunResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Node classification benchmark runner.")
-    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
-    parser.add_argument("--datasets", nargs="+", choices=SUPPORTED_DATASETS)
+    parser.add_argument("--dataset")
+    parser.add_argument("--datasets", nargs="+")
     parser.add_argument("--root", default="data", help="Dataset root directory.")
-    parser.add_argument("--model", choices=SUPPORTED_MODELS)
-    parser.add_argument("--models", nargs="+", choices=SUPPORTED_MODELS)
+    parser.add_argument("--model")
+    parser.add_argument("--models", nargs="+")
     parser.add_argument("--feature-type", dest="feature_type")
     parser.add_argument("--feature-types", nargs="+", dest="feature_types")
     parser.add_argument("--hidden-dim", type=int, default=256)
@@ -66,10 +66,32 @@ def parse_args() -> argparse.Namespace:
     if not args.model and not args.models:
         parser.error("Provide --model or --models.")
 
-    args.datasets = args.datasets or [args.dataset]
-    args.models = args.models or [args.model]
-    args.feature_types = args.feature_types or ([args.feature_type] if args.feature_type else ["raw"])
+    args.datasets = [_normalize_dataset_name(name) for name in (args.datasets or [args.dataset])]
+    args.models = [_normalize_model_name(name) for name in (args.models or [args.model])]
+    args.feature_types = [_normalize_feature_name(name) for name in (args.feature_types or ([args.feature_type] if args.feature_type else ["raw"]))]
     return args
+
+
+def _normalize_dataset_name(name: str) -> str:
+    normalized = name.strip().lower().replace("_", "-")
+    if normalized not in SUPPORTED_DATASETS:
+        raise SystemExit(
+            f"Unsupported dataset '{name}'. Choose from: {', '.join(SUPPORTED_DATASETS)}"
+        )
+    return normalized
+
+
+def _normalize_model_name(name: str) -> str:
+    normalized = name.strip().lower()
+    if normalized not in SUPPORTED_MODELS:
+        raise SystemExit(
+            f"Unsupported model '{name}'. Choose from: {', '.join(SUPPORTED_MODELS)}"
+        )
+    return normalized
+
+
+def _normalize_feature_name(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
 
 
 def set_seed(seed: int) -> None:
