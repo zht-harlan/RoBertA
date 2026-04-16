@@ -188,6 +188,19 @@ def _resolve_existing_file(base_dir: Path, relative_candidates: list[str]) -> Pa
     )
 
 
+def _resolve_case_insensitive_dir(root: Path, target_name: str) -> Path:
+    direct_path = root / target_name
+    if direct_path.exists():
+        return direct_path
+
+    target_lower = target_name.lower()
+    for child in root.iterdir():
+        if child.is_dir() and child.name.lower() == target_lower:
+            return child
+
+    raise FileNotFoundError(f"Dataset directory does not exist under {root}: {target_name}")
+
+
 def _coerce_feature_tensor(value: torch.Tensor | np.ndarray) -> torch.Tensor:
     if isinstance(value, np.ndarray):
         value = torch.from_numpy(value)
@@ -371,9 +384,7 @@ def _load_split_indices(dataset_dir: Path, split_name: str, num_nodes: int) -> t
 
 
 def _load_local_dataset(canonical_name: str, root: Path, feature_type: str) -> LoadedGraphDataset:
-    dataset_dir = root / canonical_name
-    if not dataset_dir.exists():
-        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir}")
+    dataset_dir = _resolve_case_insensitive_dir(root, canonical_name)
 
     x = _load_feature_tensor(dataset_dir, feature_type)
     y = _load_labels(dataset_dir)
