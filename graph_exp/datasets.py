@@ -176,7 +176,7 @@ def _load_public_dataset(
 def _load_tensor_file(path: Path) -> torch.Tensor | dict | list:
     suffix = path.suffix.lower()
     if suffix in {".pt", ".pth"}:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cpu", weights_only=False)
     if suffix == ".npy":
         return torch.from_numpy(np.load(path, allow_pickle=True))
     if suffix == ".npz":
@@ -273,7 +273,7 @@ def _load_local_bundle(dataset_dir: Path) -> Data | dict:
             "graph_data.pth",
         ],
     )
-    return torch.load(bundle_path, map_location="cpu")
+    return torch.load(bundle_path, map_location="cpu", weights_only=False)
 
 
 def _extract_data_from_bundle(bundle: object) -> Data:
