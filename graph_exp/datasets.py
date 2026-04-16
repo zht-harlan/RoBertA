@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import ast
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 from ogb.nodeproppred import PygNodePropPredDataset
 from torch_geometric.data import Data
@@ -258,69 +260,53 @@ def _dataset_stem(dataset_dir: Path) -> str:
     return dataset_dir.name
 
 
-def _load_local_bundle(dataset_dir: Path) -> Data | dict:
+def _load_local_dataframe(dataset_dir: Path) -> pd.DataFrame:
     stem = _dataset_stem(dataset_dir)
-    bundle_path = _resolve_existing_file(
+    csv_path = _resolve_existing_file(
         dataset_dir,
         [
-            f"{stem}.pt",
-            f"{stem}.pth",
-            f"{stem.lower()}.pt",
-            f"{stem.lower()}.pth",
-            "data.pt",
-            "data.pth",
-            "graph_data.pt",
-            "graph_data.pth",
+            f"{stem}.csv",
+            f"{stem.lower()}.csv",
+            "data.csv",
         ],
     )
-    return torch.load(bundle_path, map_location="cpu", weights_only=False)
+    return pd.read_csv(csv_path)
 
 
-def _extract_data_from_bundle(bundle: object) -> Data:
-    if isinstance(bundle, Data):
-        return bundle
-    if isinstance(bundle, dict):
-        for key in ["data", "graph", "pyg_data"]:
-            if key in bundle and isinstance(bundle[key], Data):
-                return bundle[key]
-    raise TypeError("Local dataset bundle must be a PyG Data object or a dict containing one.")
+def _parse_neighbour_list(value: object) -> list[int]:
+    if isinstance(value, list):
+        return [int(item) for item in value]
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return []
+        parsed = ast.literal_eval(value)
+        if isinstance(parsed, list):
+            return [int(item) for item in parsed]
+    raise ValueError(f"Unsupported neighbour field: {value!r}")
 
 
-def _extract_split_from_bundle(bundle: object, split_name: str, num_nodes: int) -> torch.Tensor | None:
-    if not isinstance(bundle, dict):
-        return None
+def _build_edge_index_from_dataframe(df: pd.DataFrame) -> torch.Tensor:
+    if "node_id" not in df.columns or "neighbour" not in df.columns:
+        raise ValueError("Local dataset CSV must contain 'node_id' and 'neighbour' columns.")
 
-    split_sources = []
-    for key in ["split_idx", "splits", "split"]:
-        if key in bundle and isinstance(bundle[key], dict):
-            split_sources.append(bundle[key])
-    split_sources.append(bundle)
+    sources: list[int] = []
+    targets: list[int] = []
+    for row in df.itertuples(index=False):
+        node_id = int(getattr(row, "node_id"))
+        neighbours = _parse_neighbour_list(getattr(row, "neighbour"))
+        for neighbour in neighbours:
+            sources.append(node_id)
+            targets.append(neighbour)
 
-    canonical_names = {
-        "train": ["train"],
-        "valid": ["valid", "val"],
-        "test": ["test"],
-    }[split_name]
-    for source in split_sources:
-        for key in canonical_names:
-            if key in source:
-                return _extract_split_indices(source[key], num_nodes)
-    return None
+    if not sources:
+        raise ValueError("No edges were parsed from the 'neighbour' column.")
 
-
-def _extract_masks_from_data(data: Data, split_name: str, num_nodes: int) -> torch.Tensor | None:
-    attr_names = {
-        "train": ["train_mask"],
-        "valid": ["val_mask", "valid_mask"],
-        "test": ["test_mask"],
-    }[split_name]
-    for attr_name in attr_names:
-        if hasattr(data, attr_name):
-            mask = getattr(data, attr_name)
-            if mask is None:
-                continue
-            return _extract_split_indices(mask, num_nodes)
-    return None
+    edge_index = torch.tensor([sources, targets], dtype=torch.long)
+    reversed_edge_index = edge_index[[1, 0], :]
+    return torch.cat([edge_index, reversed_edge_index], dim=1).contiguous()
 
 
 def _load_feature_tensor(dataset_dir: Path, feature_type: str) -> torch.Tensor:
@@ -475,46 +461,54 @@ def _load_split_indices(dataset_dir: Path, split_name: str, num_nodes: int) -> t
     raise FileNotFoundError(f"Could not resolve {split_name} split files in {dataset_dir}.")
 
 
-def _load_local_dataset(canonical_name: str, root: Path, feature_type: str) -> LoadedGraphDataset:
+def _load_local_dataset(
+    canonical_name: str,
+    root: Path,
+    feature_type: str,
+    seed: int,
+    train_ratio: float,
+    val_ratio: float,
+) -> LoadedGraphDataset:
     dataset_dir = _resolve_case_insensitive_dir(root, canonical_name)
+    dataframe = _load_local_dataframe(dataset_dir)
+    if "label" not in dataframe.columns:
+        raise ValueError(f"Local dataset CSV must contain a 'label' column: {dataset_dir}")
+    if "node_id" not in dataframe.columns:
+        raise ValueError(f"Local dataset CSV must contain a 'node_id' column: {dataset_dir}")
 
-    bundle = _load_local_bundle(dataset_dir)
-    data = _extract_data_from_bundle(bundle)
-    if getattr(data, "y", None) is None:
-        data.y = _load_labels(dataset_dir)
-    else:
-        data.y = _coerce_labels(data.y)
-    if getattr(data, "edge_index", None) is None:
-        data.edge_index = _load_edge_index(dataset_dir)
-    else:
-        data.edge_index = _coerce_edge_index(data.edge_index)
-
-    data.x = _load_feature_tensor(dataset_dir, feature_type)
-    if data.x.size(0) != data.y.numel():
+    dataframe = dataframe.sort_values("node_id").reset_index(drop=True)
+    expected_node_ids = np.arange(len(dataframe))
+    actual_node_ids = dataframe["node_id"].to_numpy()
+    if not np.array_equal(actual_node_ids, expected_node_ids):
         raise ValueError(
-            f"Feature rows ({data.x.size(0)}) and label count ({data.y.numel()}) do not match for {dataset_dir}."
+            f"Expected node_id to be contiguous from 0..N-1 in {dataset_dir}, "
+            f"got first ids {actual_node_ids[:5].tolist()}."
         )
 
-    num_nodes = data.x.size(0)
-    train_idx = _extract_split_from_bundle(bundle, "train", num_nodes) or _extract_masks_from_data(data, "train", num_nodes)
-    val_idx = _extract_split_from_bundle(bundle, "valid", num_nodes) or _extract_masks_from_data(data, "valid", num_nodes)
-    test_idx = _extract_split_from_bundle(bundle, "test", num_nodes) or _extract_masks_from_data(data, "test", num_nodes)
+    x = _load_feature_tensor(dataset_dir, feature_type)
+    y = _coerce_labels(torch.tensor(dataframe["label"].to_numpy(), dtype=torch.long))
+    edge_index = _build_edge_index_from_dataframe(dataframe)
 
-    if train_idx is None:
-        train_idx = _load_split_indices(dataset_dir, "train", num_nodes)
-    if val_idx is None:
-        val_idx = _load_split_indices(dataset_dir, "valid", num_nodes)
-    if test_idx is None:
-        test_idx = _load_split_indices(dataset_dir, "test", num_nodes)
+    if x.size(0) != y.numel():
+        raise ValueError(
+            f"Feature rows ({x.size(0)}) and label count ({y.numel()}) do not match for {dataset_dir}."
+        )
 
-    data.train_mask = _to_mask(train_idx, num_nodes)
-    data.val_mask = _to_mask(val_idx, num_nodes)
-    data.test_mask = _to_mask(test_idx, num_nodes)
+    train_mask, val_mask, test_mask = _build_random_split(
+        labels=y,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        seed=seed,
+    )
+    data = Data(x=x, edge_index=edge_index, y=y)
+    data.train_mask = train_mask
+    data.val_mask = val_mask
+    data.test_mask = test_mask
 
     return LoadedGraphDataset(
         data=data,
-        num_features=data.x.size(-1),
-        num_classes=int(data.y.max().item()) + 1,
+        num_features=x.size(-1),
+        num_classes=int(y.max().item()) + 1,
         canonical_name=canonical_name,
         feature_type=feature_type,
     )
@@ -533,7 +527,14 @@ def load_dataset(
     root = Path(root)
 
     if canonical_name in {"children", "history", "photo"}:
-        return _load_local_dataset(canonical_name, root, normalized_feature_type)
+        return _load_local_dataset(
+            canonical_name=canonical_name,
+            root=root,
+            feature_type=normalized_feature_type,
+            seed=seed,
+            train_ratio=train_ratio,
+            val_ratio=val_ratio,
+        )
 
     return _load_public_dataset(
         canonical_name=canonical_name,
