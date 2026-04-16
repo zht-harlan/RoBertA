@@ -169,13 +169,12 @@ def build_stratified_split(
     )
 
 
-def tokenize_texts(tokenizer, texts: list[str], max_length: int) -> dict[str, torch.Tensor]:
+def tokenize_texts(tokenizer, texts: list[str], max_length: int) -> dict[str, list[list[int]]]:
     return tokenizer(
         texts,
         truncation=True,
         max_length=max_length,
         padding=False,
-        return_tensors="pt",
     )
 
 
