@@ -56,6 +56,14 @@ class TextClassificationDataset(Dataset):
         return item
 
 
+def select_encoding_subset(
+    encodings: dict[str, list[list[int]]],
+    indices: torch.Tensor,
+) -> dict[str, list[list[int]]]:
+    index_list = indices.tolist()
+    return {key: [value[i] for i in index_list] for key, value in encodings.items()}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RoBERTa text classification runner.")
     parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
@@ -221,9 +229,9 @@ def train_one_run(args: argparse.Namespace, run_seed: int, device: torch.device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     encodings = tokenize_texts(tokenizer, texts, args.max_length)
 
-    train_dataset = TextClassificationDataset({key: value[train_idx] for key, value in encodings.items()}, labels[train_idx])
-    val_dataset = TextClassificationDataset({key: value[val_idx] for key, value in encodings.items()}, labels[val_idx])
-    test_dataset = TextClassificationDataset({key: value[test_idx] for key, value in encodings.items()}, labels[test_idx])
+    train_dataset = TextClassificationDataset(select_encoding_subset(encodings, train_idx), labels[train_idx])
+    val_dataset = TextClassificationDataset(select_encoding_subset(encodings, val_idx), labels[val_idx])
+    test_dataset = TextClassificationDataset(select_encoding_subset(encodings, test_idx), labels[test_idx])
 
     train_loader = make_dataloader(train_dataset, args.batch_size, shuffle=True, tokenizer=tokenizer)
     val_loader = make_dataloader(val_dataset, args.batch_size, shuffle=False, tokenizer=tokenizer)
