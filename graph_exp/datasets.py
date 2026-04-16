@@ -37,6 +37,16 @@ LOCAL_DATASET_ALIASES = {
     "photo": "photo",
 }
 
+LOCAL_FEATURE_ALIASES = {
+    "plm": "roberta-base-512-cls",
+    "roberta": "roberta-base-512-cls",
+    "roberta-base": "roberta-base-512-cls",
+    "roberta-base-512-cls": "roberta-base-512-cls",
+    "qwen": "qwen2.5-7b-256-mean",
+    "qwen2.5": "qwen2.5-7b-256-mean",
+    "qwen2.5-7b-256-mean": "qwen2.5-7b-256-mean",
+}
+
 
 def _canonicalize_name(name: str) -> str:
     normalized = name.strip().lower().replace("_", "-")
@@ -244,7 +254,78 @@ def _coerce_labels(value: torch.Tensor | np.ndarray) -> torch.Tensor:
     return value
 
 
+def _dataset_stem(dataset_dir: Path) -> str:
+    return dataset_dir.name
+
+
+def _load_local_bundle(dataset_dir: Path) -> Data | dict:
+    stem = _dataset_stem(dataset_dir)
+    bundle_path = _resolve_existing_file(
+        dataset_dir,
+        [
+            f"{stem}.pt",
+            f"{stem}.pth",
+            f"{stem.lower()}.pt",
+            f"{stem.lower()}.pth",
+            "data.pt",
+            "data.pth",
+            "graph_data.pt",
+            "graph_data.pth",
+        ],
+    )
+    return torch.load(bundle_path, map_location="cpu")
+
+
+def _extract_data_from_bundle(bundle: object) -> Data:
+    if isinstance(bundle, Data):
+        return bundle
+    if isinstance(bundle, dict):
+        for key in ["data", "graph", "pyg_data"]:
+            if key in bundle and isinstance(bundle[key], Data):
+                return bundle[key]
+    raise TypeError("Local dataset bundle must be a PyG Data object or a dict containing one.")
+
+
+def _extract_split_from_bundle(bundle: object, split_name: str, num_nodes: int) -> torch.Tensor | None:
+    if not isinstance(bundle, dict):
+        return None
+
+    split_sources = []
+    for key in ["split_idx", "splits", "split"]:
+        if key in bundle and isinstance(bundle[key], dict):
+            split_sources.append(bundle[key])
+    split_sources.append(bundle)
+
+    canonical_names = {
+        "train": ["train"],
+        "valid": ["valid", "val"],
+        "test": ["test"],
+    }[split_name]
+    for source in split_sources:
+        for key in canonical_names:
+            if key in source:
+                return _extract_split_indices(source[key], num_nodes)
+    return None
+
+
+def _extract_masks_from_data(data: Data, split_name: str, num_nodes: int) -> torch.Tensor | None:
+    attr_names = {
+        "train": ["train_mask"],
+        "valid": ["val_mask", "valid_mask"],
+        "test": ["test_mask"],
+    }[split_name]
+    for attr_name in attr_names:
+        if hasattr(data, attr_name):
+            mask = getattr(data, attr_name)
+            if mask is None:
+                continue
+            return _extract_split_indices(mask, num_nodes)
+    return None
+
+
 def _load_feature_tensor(dataset_dir: Path, feature_type: str) -> torch.Tensor:
+    normalized_feature_type = LOCAL_FEATURE_ALIASES.get(feature_type, feature_type)
+    stem = _dataset_stem(dataset_dir)
     candidates = [
         f"{feature_type}.pt",
         f"{feature_type}.pth",
@@ -263,9 +344,20 @@ def _load_feature_tensor(dataset_dir: Path, feature_type: str) -> torch.Tensor:
         f"features/{feature_type}.npy",
         f"features/{feature_type}/x.pt",
         f"features/{feature_type}/x.npy",
+        f"Feature/{stem}_{normalized_feature_type.replace('-', '_')}.npy",
+        f"Feature/{stem}_{normalized_feature_type.replace('-', '_')}.pt",
+        f"Feature/{stem}_{normalized_feature_type.replace('-', '.').replace('.', '_')}.npy",
     ]
     if feature_type == "raw":
         candidates.extend(["x.pt", "x.npy", "features.pt", "features.npy"])
+    if normalized_feature_type != feature_type:
+        candidates.extend(
+            [
+                f"{normalized_feature_type}.pt",
+                f"{normalized_feature_type}.npy",
+                f"Feature/{stem}_{normalized_feature_type.replace('-', '_')}.npy",
+            ]
+        )
     feature_path = _resolve_existing_file(dataset_dir, candidates)
     return _coerce_feature_tensor(_load_tensor_file(feature_path))
 
@@ -386,27 +478,43 @@ def _load_split_indices(dataset_dir: Path, split_name: str, num_nodes: int) -> t
 def _load_local_dataset(canonical_name: str, root: Path, feature_type: str) -> LoadedGraphDataset:
     dataset_dir = _resolve_case_insensitive_dir(root, canonical_name)
 
-    x = _load_feature_tensor(dataset_dir, feature_type)
-    y = _load_labels(dataset_dir)
-    edge_index = _load_edge_index(dataset_dir)
-    if x.size(0) != y.numel():
+    bundle = _load_local_bundle(dataset_dir)
+    data = _extract_data_from_bundle(bundle)
+    if getattr(data, "y", None) is None:
+        data.y = _load_labels(dataset_dir)
+    else:
+        data.y = _coerce_labels(data.y)
+    if getattr(data, "edge_index", None) is None:
+        data.edge_index = _load_edge_index(dataset_dir)
+    else:
+        data.edge_index = _coerce_edge_index(data.edge_index)
+
+    data.x = _load_feature_tensor(dataset_dir, feature_type)
+    if data.x.size(0) != data.y.numel():
         raise ValueError(
-            f"Feature rows ({x.size(0)}) and label count ({y.numel()}) do not match for {dataset_dir}."
+            f"Feature rows ({data.x.size(0)}) and label count ({data.y.numel()}) do not match for {dataset_dir}."
         )
 
-    train_idx = _load_split_indices(dataset_dir, "train", x.size(0))
-    val_idx = _load_split_indices(dataset_dir, "valid", x.size(0))
-    test_idx = _load_split_indices(dataset_dir, "test", x.size(0))
+    num_nodes = data.x.size(0)
+    train_idx = _extract_split_from_bundle(bundle, "train", num_nodes) or _extract_masks_from_data(data, "train", num_nodes)
+    val_idx = _extract_split_from_bundle(bundle, "valid", num_nodes) or _extract_masks_from_data(data, "valid", num_nodes)
+    test_idx = _extract_split_from_bundle(bundle, "test", num_nodes) or _extract_masks_from_data(data, "test", num_nodes)
 
-    data = Data(x=x, edge_index=edge_index, y=y)
-    data.train_mask = _to_mask(train_idx, x.size(0))
-    data.val_mask = _to_mask(val_idx, x.size(0))
-    data.test_mask = _to_mask(test_idx, x.size(0))
+    if train_idx is None:
+        train_idx = _load_split_indices(dataset_dir, "train", num_nodes)
+    if val_idx is None:
+        val_idx = _load_split_indices(dataset_dir, "valid", num_nodes)
+    if test_idx is None:
+        test_idx = _load_split_indices(dataset_dir, "test", num_nodes)
+
+    data.train_mask = _to_mask(train_idx, num_nodes)
+    data.val_mask = _to_mask(val_idx, num_nodes)
+    data.test_mask = _to_mask(test_idx, num_nodes)
 
     return LoadedGraphDataset(
         data=data,
-        num_features=x.size(-1),
-        num_classes=int(y.max().item()) + 1,
+        num_features=data.x.size(-1),
+        num_classes=int(data.y.max().item()) + 1,
         canonical_name=canonical_name,
         feature_type=feature_type,
     )
